@@ -14,33 +14,25 @@ class SpectralNorm:
     def __init__(self, name, bound=False):
         self.name = name
         self.bound = bound
-
     def compute_weight(self, module):
         weight = getattr(module, self.name + '_orig')
         u = getattr(module, self.name + '_u')
         size = weight.size()
         weight_mat = weight.contiguous().view(size[0], -1)
-
         with torch.no_grad():
             v = weight_mat.t() @ u
             v = v / v.norm()
             u = weight_mat @ v
             u = u / u.norm()
-
         sigma = u @ weight_mat @ v
-
         if self.bound:
             weight_sn = weight / (sigma + 1e-6) * torch.clamp(sigma, max=1)
-
         else:
             weight_sn = weight / sigma
-
         return weight_sn, u
-
     @staticmethod
     def apply(module, name, bound):
         fn = SpectralNorm(name, bound)
-
         weight = getattr(module, name)
         del module._parameters[name]
         module.register_parameter(name + '_orig', weight)
@@ -48,38 +40,25 @@ class SpectralNorm:
         u = weight.new_empty(input_size).normal_()
         module.register_buffer(name, weight)
         module.register_buffer(name + '_u', u)
-
         module.register_forward_pre_hook(fn)
-
         return fn
-
     def __call__(self, module, input):
         weight_sn, u = self.compute_weight(module)
         setattr(module, self.name, weight_sn)
         setattr(module, self.name + '_u', u)
-
-
+        
 def spectral_norm(module, init=True, std=1, bound=False):
     if init:
         nn.init.normal_(module.weight, 0, std)
-
     if hasattr(module, 'bias') and module.bias is not None:
         module.bias.data.zero_()
-
     SpectralNorm.apply(module, 'weight', bound=bound)
-
     return module
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 
 class GraphConv(nn.Module):
-
     def __init__(self, in_channels, out_channels, num_edge_type, std, bound=True, add_self=False):
         super(GraphConv, self).__init__()
-        
         self.add_self = add_self
         self.linear_node = spectral_norm(nn.Linear(in_channels, out_channels), std=std, bound=bound)
         self.linear_edge = spectral_norm(nn.Linear(in_channels, out_channels * num_edge_type), std=std, bound=bound)
@@ -88,15 +67,15 @@ class GraphConv(nn.Module):
         self.out_ch = out_channels
         eps = torch.tensor([0], dtype=torch.float32)
         self.eps = nn.Parameter(eps)
-        self.W = [nn.Linear(self.in_ch, self.out_ch), nn.Linear(self.in_ch, self.out_ch), nn.Linear(self.in_ch, self.out_ch),
-                  nn.Linear(self.in_ch, self.out_ch)]
-        self.a = [nn.Linear(2 * self.out_ch, 1), nn.Linear(2 * self.out_ch, 1), nn.Linear(2 * self.out_ch, 1),
-                  nn.Linear(2 * self.out_ch, 1)]
+        self.W = nn.ModuleList([nn.Linear(self.in_ch, self.out_ch) for i in range(4)])
+        self.a = nn.ModuleList([nn.Linear(2 * self.out_ch, 1) for i in range(4)])
         self.leaky_relu = nn.LeakyReLU(0.2)
         self.linear_edge1 = spectral_norm(nn.Linear(in_channels+1, out_channels * num_edge_type), std=std, bound=bound)
         self.linear_node1 = nn.Linear(in_channels, in_channels)
         self.linear_edge2 = nn.Linear(out_channels * num_edge_type, out_channels * num_edge_type)
+        self.output = nn.Linear(self.out_ch, self.out_ch)
 
+# GraphConv(1,1,4,1).to('cuda')
 
     def forward(self, adj, h, atype):
         # orginal
@@ -269,17 +248,14 @@ class GraphConv(nn.Module):
             m = m.permute(0, 3, 1, 2) # m: (batchsize, edge_type, node, ch)
             hr = torch.matmul(adj, m)  # hr: (batchsize, edge_type, node, ch)
             hr = hr.sum(dim=1)   # hr: (batchsize, node, ch)
-            output = nn.Linear(self.out_ch, self.out_ch)
-            return output((1+self.eps)*hr + h_node)
+            return self.output((1+self.eps)*hr + h_node)
         else:
             raise NotImplementedError
     
 
 class EnergyFunc(nn.Module):
-
     def __init__(self, n_atom_type, hidden, num_edge_type=4, atype=0, swish=True, depth=2, add_self=False, dropout=0):
         super(EnergyFunc, self).__init__()
-
         self.depth = depth
         self.graphconv1 = GraphConv(n_atom_type, hidden, num_edge_type, std=1, bound=False, add_self=add_self)
         self.graphconv = nn.ModuleList(GraphConv(hidden, hidden, num_edge_type, std=1e-10, add_self=add_self) for i in range(self.depth))
@@ -287,28 +263,22 @@ class EnergyFunc(nn.Module):
         self.dropout = dropout
         self.atype = atype
         self.linear = nn.Linear(hidden, 1)
-
+# EnergyFunc(10,64).to('cuda')
     def forward(self, adj, h):
         h = h.permute(0, 2, 1)
         out = self.graphconv1(adj, h, self.atype)
-            
         out = F.dropout(out, p=self.dropout, training=self.training)
-        
         if self.swish:
             out = swish(out)
         else:
             out = F.leaky_relu(out, negative_slope=0.2)
-
-
         for i in range(self.depth):
-            out = self.graphconv[i](adj, out, self.atype)
-                
+            out = self.graphconv[i](adj, out, self.atype)    
             out = F.dropout(out, p=self.dropout, training=self.training)
             if self.swish:
                 out = swish(out)
             else:
                 out = F.relu(out)
-        
         out = out.sum(1) # (batchsize, node, ch) --> (batchsize, ch)
         out = self.linear(out)
         return out # Energy value (batchsize, 1)
