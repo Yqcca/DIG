@@ -70,7 +70,7 @@ class GraphConv(nn.Module):
         self.W = nn.ModuleList([nn.Linear(self.in_ch, self.out_ch) for i in range(4)])
         self.a = nn.ModuleList([nn.Linear(2 * self.out_ch, 1) for i in range(4)])
         self.leaky_relu = nn.LeakyReLU(0.2)
-        self.linear_edge1 = spectral_norm(nn.Linear(in_channels+1, out_channels * num_edge_type), std=std, bound=bound)
+        self.linear_edge1 = nn.Linear(in_channels+1, out_channels * num_edge_type)
         self.linear_node1 = nn.Linear(in_channels, in_channels)
         self.linear_edge2 = nn.Linear(out_channels * num_edge_type, out_channels * num_edge_type)
         self.output = nn.Linear(self.out_ch, self.out_ch)
@@ -170,6 +170,7 @@ class GraphConv(nn.Module):
 
         # GSN
         elif atype == 5:
+            # square
             # def count_squares(adjacency_matrix):
             #     num_nodes = len(adjacency_matrix)
             #     squares_count = [0] * num_nodes
@@ -191,32 +192,23 @@ class GraphConv(nn.Module):
             #             dfs(node, node, depth, [node])
 
             #     return squares_count
-    
+            
+            # triangle
             mb, node, _ = h.shape # h: (batchsize, ch, in)
-            asd = sum([adj[:, i, :, :] for i in range(self.num_edge_type)])
+            asd = sum([adj[:, r, :, :] for r in range(self.num_edge_type)])
             ls = []
             for i in asd:
                 # squares_count(i)
                 l = []
-                for nodej in [j for j in range(i.shape[0])]:
+                for s in range(i.shape[0]):
                     # Find the neighbors of the current node
-                    neighbors = np.where(i[nodej] == 1)[0]
-
-                    # Initialize a count for triangles
-                    triangle_count = 0
-
-                    # Iterate through the neighbors and check for triangles
-                    for neighbor in neighbors:
-                        common_neighbors = np.intersect1d(neighbors, np.where(i[neighbor] == 1)[0])
-                        triangle_count += len(common_neighbors)
-
-                    # Divide by 2 to avoid double-counting
-                    triangle_count //= 2
-                    l.append(triangle_count)
+                    row_i = i[s, :]
+                    num_triangles = (row_i @ i @ row_i) // 2
+                    l.append(num_triangles)
                 ls.append(l)
             b = torch.tensor(ls)[:,:,None]
-            sc = torch.cat((h,b), -1)
-            m = self.linear_edge1(sc) # h_node: (batchsize, ch, out*4)
+            h = torch.cat((h,b), -1)
+            m = self.linear_edge1(h) # h_node: (batchsize, ch, out*4)
             m = m.reshape(mb, node, self.out_ch, self.num_edge_type) # batch, ch, out, 4
             m = m.permute(0, 3, 1, 2) # m: (batchsize, edge_type, node, ch)
             hr = torch.matmul(adj, m)  # hr: (batchsize, edge_type, node, ch)

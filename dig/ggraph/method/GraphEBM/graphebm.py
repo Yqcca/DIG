@@ -7,13 +7,18 @@ from torch.optim import Adam
 from tqdm import tqdm
 from rdkit import Chem
 
+from torch_geometric.loader import DenseDataLoader
+from rdkit import RDLogger
 
+from dig.ggraph.dataset import ZINC250k, ZINC800
+from dig.ggraph.evaluation import PropOptEvaluator, ConstPropOptEvaluator
 
 from dig.ggraph.method import Generator
 from dig.ggraph.utils import gen_mol_from_one_shot_tensor
 from dig.ggraph.utils import qed, calculate_min_plogp, reward_target_molecule_similarity
 from .energy_func import EnergyFunc
 from .util import rescale_adj, requires_grad, clip_grad
+
 
 from tdc.chem_utils.oracle import oracle
 from tdc import Oracle
@@ -362,6 +367,98 @@ class GraphEBM(Generator):
                 print('==========================================')
             print('Epoch: {:03d}, Loss: {:.6f}, Energy Loss: {:.6f}, Regularizer Loss: {:.6f}, Sec/Epoch: {:.2f}'.format(epoch+1, (sum(losses)/len(losses)).item(), (sum(losses_en)/len(losses_en)).item(), (sum(losses_reg)/len(losses_reg)).item(), t_end-t_start))
             print('==========================================')
+        RDLogger.DisableLog('rdApp.error')
+        RDLogger.DisableLog('rdApp.warning')
+        dataset_qed = ZINC250k(one_shot=True, root='./zinc250k_qed', prop_name='qed')
+        splits = dataset_qed.get_split_idx()
+        train_set_qed = dataset_qed[splits['train_idx']]
+        atomic_num_list = dataset_qed.atom_list
+        train_smiles = [data.smile for data in dataset_qed[splits['train_idx']]]
+        initialization_loader_qed = DenseDataLoader(train_set_qed, batch_size=10000, shuffle=False, num_workers=0)
+        initialization_loader = initialization_loader_qed
+        save_mols_list = []
+        prop_list = []
+        ld_step=300
+        ld_noise=0.005
+        ld_step_size=0.2
+        
+        for _, batch in enumerate(tqdm(initialization_loader)): 
+            ### Initialization
+            gen_x = batch.x.to(self.device).to(dtype=torch.float32)
+            gen_adj = batch.adj.to(self.device).to(dtype=torch.float32)
+
+            gen_x.requires_grad = True
+            gen_adj.requires_grad = True
+            requires_grad(parameters, False)
+            self.energy_function.eval()
+
+            noise_x = torch.randn_like(gen_x, device=self.device)
+            noise_adj = torch.randn_like(gen_adj, device=self.device)
+
+            ### Langevin dynamics
+            for _ in range(ld_step):
+                noise_x.normal_(0, ld_noise)
+                noise_adj.normal_(0, ld_noise)
+                gen_x.data.add_(noise_x.data)
+                gen_adj.data.add_(noise_adj.data)
+
+
+                gen_out = self.energy_function(gen_adj, gen_x)
+                gen_out.sum().backward()
+                if clamp:
+                    gen_x.grad.data.clamp_(-0.01, 0.01)
+                    gen_adj.grad.data.clamp_(-0.01, 0.01)
+
+
+                gen_x.data.add_(gen_x.grad.data, alpha=-ld_step_size)
+                gen_adj.data.add_(gen_adj.grad.data, alpha=-ld_step_size)
+
+                gen_x.grad.detach_()
+                gen_x.grad.zero_()
+                gen_adj.grad.detach_()
+                gen_adj.grad.zero_()
+
+                gen_x.data.clamp_(0, 1 + c)
+                gen_adj.data.clamp_(0, 1)
+                
+                gen_x_t = copy.deepcopy(gen_x)
+                gen_adj_t = copy.deepcopy(gen_adj)
+                gen_adj_t = (gen_adj_t + gen_adj_t.permute(0, 1, 3, 2)) / 2  
+                
+                gen_mols = gen_mol_from_one_shot_tensor(gen_adj_t, gen_x_t, atomic_num_list, correct_validity=True)
+                gen_smiles = [Chem.MolToSmiles(mol) for mol in gen_mols]
+
+                for mol_idx in range(len(gen_smiles)):
+                    if gen_mols[mol_idx] is not None:
+                        tmp_mol = gen_mols[mol_idx]
+                        tmp_smiles = gen_smiles[mol_idx]
+                        if tmp_smiles not in train_smiles:
+                            if metric == 'qed':
+                                tmp_qed = qed(tmp_mol)
+                                if tmp_qed > 0.930:
+                                    save_mols_list.append(tmp_mol)
+                                    prop_list.append(tmp_qed)
+                            elif metric == 'drd2':
+                                ADRD2 = Oracle(name = 'drd2')
+                                tmp_qed = ADRD2(tmp_smiles)
+                                if tmp_qed > 0.1:
+                                    save_mols_list.append(tmp_mol)
+                                    prop_list.append(tmp_qed)
+                            elif metric == 'median1':
+                                ADRD2 = Oracle(name = 'median1')
+                                tmp_qed = ADRD2(tmp_smiles)
+                                if tmp_qed > 0.1:
+                                    save_mols_list.append(tmp_mol)
+                                    prop_list.append(tmp_qed)
+                            elif metric == 'median2':
+                                ADRD2 = Oracle(name = 'median2')
+                                tmp_qed = ADRD2(tmp_smiles)
+                                if tmp_qed > 0.1:
+                                    save_mols_list.append(tmp_mol)
+                                    prop_list.append(tmp_qed)
+                            else:
+                                raise NotImplementedError
+        print(sorted(prop_list)[::-1][:10])
     
 
     def run_prop_opt(self, checkpoint_path, initialization_loader, c, ld_step, ld_noise, ld_step_size, clamp, atomic_num_list, train_smiles, metric):
