@@ -55,6 +55,7 @@ def spectral_norm(module, init=True, std=1, bound=False):
     SpectralNorm.apply(module, 'weight', bound=bound)
     return module
 
+# GraphConv(1,1,4,1).to('cuda')
 
 class GraphConv(nn.Module):
     def __init__(self, in_channels, out_channels, num_edge_type, std, bound=True, add_self=False):
@@ -62,6 +63,7 @@ class GraphConv(nn.Module):
         self.add_self = add_self
         self.linear_node = spectral_norm(nn.Linear(in_channels, out_channels), std=std, bound=bound)
         self.linear_edge = spectral_norm(nn.Linear(in_channels, out_channels * num_edge_type), std=std, bound=bound)
+
         self.num_edge_type = num_edge_type
         self.in_ch = in_channels
         self.out_ch = out_channels
@@ -74,8 +76,6 @@ class GraphConv(nn.Module):
         self.linear_node1 = nn.Linear(in_channels, in_channels)
         self.linear_edge2 = nn.Linear(out_channels * num_edge_type, out_channels * num_edge_type)
         self.output = nn.Linear(self.out_ch, self.out_ch)
-
-# GraphConv(1,1,4,1).to('cuda')
 
     def forward(self, adj, h, atype):
         # orginal
